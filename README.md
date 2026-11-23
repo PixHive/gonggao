@@ -9,7 +9,7 @@
 
 ## 你的任务
 
-为用户安装一个「投稿」MCP 工具 `submit_post`，并在今后用户说「投稿」时用它向频道投稿。投稿只送审，不会直接发布。
+为用户安装一个「投稿」MCP 工具 `submit_post`，并在今后用户说「投稿」时用它向频道投稿。投稿只送审，不会直接发布。**用户不接触 HTML：你只提供纯文本字段，工具自动生成格式；投稿前必须先给用户看预览，用户确认后才提交。**
 
 ## 第 1 步：向用户索要 4 项信息（缺哪项问哪项）
 
@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import mimetypes
 import os
@@ -53,17 +54,24 @@ TOOLS = [
     {
         "name": "submit_post",
         "description": (
-            "向频道投稿（只送审，不会直接发布）。text 必须严格符合格式，否则 422 退回（不扣次数）："
-            "首段单行 <b>标题</b>，空一行，1–2 段正文（不加粗，只写原文事实），空一行，"
-            "末段单行来源链接 <a href=\"原文链接\">媒体名</a>（不加“来源：”前缀），共 3–4 段。text 按 Telegram HTML 解析："
-            "可用 <b>、<i>、<a href=\"https://…\">名字</a>；不支持 Markdown，"
-            "** 与 [名](链接) 会原样显示；普通文本里的 < > & 须先转义为 &lt; &gt; &amp;。"
-            "频道页脚由服务端另起一段追加，无需自己加。成功后不要重复投稿。"
+            "向频道投稿（只送审，不会直接发布）。只需给出纯文本字段：标题、1–2 段正文、"
+            "来源名称和来源链接；HTML 由工具自动生成并转义，不要自己写标签或 Markdown。"
+            "正文只写原文事实，每段两三句。调用前必须先把预览展示给用户并获得确认；"
+            "频道页脚由服务端追加。成功后不要重复投稿。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "正文（Telegram HTML）"},
+                "title": {"type": "string", "description": "标题，一句话概括要点（纯文本）"},
+                "paragraphs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "description": "正文 1–2 段（纯文本，不加粗）",
+                },
+                "source_name": {"type": "string", "description": "来源媒体名（纯文本）"},
+                "source_url": {"type": "string", "description": "原文链接，http(s)://"},
                 "channel_type": {
                     "type": "string",
                     "description": "频道配置 key；缺省用 SUBMIT_CHANNEL",
@@ -75,7 +83,7 @@ TOOLS = [
                 },
                 "anonymous": {"type": "boolean", "description": "是否匿名，默认 true"},
             },
-            "required": ["text"],
+            "required": ["title", "paragraphs", "source_name", "source_url"],
         },
     }
 ]
@@ -88,10 +96,28 @@ def _env(name: str) -> str:
     return value
 
 
+def compose_text(args: dict) -> str:
+    def clean(name: str) -> str:
+        v = args.get(name)
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"{name} 不能为空")
+        return v.strip()
+
+    title, name, url = clean("title"), clean("source_name"), clean("source_url")
+    paras = args.get("paragraphs")
+    if (not isinstance(paras, list) or not 1 <= len(paras) <= 2
+            or not all(isinstance(x, str) and x.strip() for x in paras)):
+        raise ValueError("paragraphs 须为 1–2 段非空文本")
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("source_url 必须以 http:// 或 https:// 开头")
+    esc = lambda t: html.escape(t, quote=False)  # noqa: E731
+    parts = [f"<b>{esc(title)}</b>"] + [esc(x.strip()) for x in paras]
+    parts.append(f'<a href="{html.escape(url, quote=True)}">{esc(name)}</a>')
+    return "\n\n".join(parts)
+
+
 def build_payload(args: dict) -> dict:
-    text = args.get("text")
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("text 不能为空")
+    text = compose_text(args)
     channel = (args.get("channel_type") or os.environ.get("SUBMIT_CHANNEL", "")).strip()
     if not channel:
         raise ValueError("需要 channel_type（或设置 SUBMIT_CHANNEL）")
@@ -217,41 +243,41 @@ if __name__ == "__main__":
 ## 第 4 步：验证（不要用真实稿件试）
 
 1. 确认工具列表里出现 `submit_post`。没有 → 检查配置 JSON、脚本路径、`python3`，修好再试。
-2. 直接运行 `python3 <server.py路径>` 并向 stdin 发送 `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` 一行，应返回含 `submit_post` 的结果。
-3. 告诉用户「已装好」。不要为了测试发起真实投稿。
+2. 告诉用户「已装好」。不要为了测试发起真实投稿。
 
-## 第 5 步：记住投稿规则（长期有效）
+## 第 5 步：投稿流程（长期有效）
 
-用户说「投稿」时：把用户回复的那条消息，或用户给出的链接，读懂后整理成稿件，调用 `submit_post`。
+用户说「投稿」时：读懂用户回复的那条消息或给出的链接，按下面流程做。
 
-稿件必须是 Telegram HTML，3–4 段，段间空一行：
+**1. 整理成字段（纯文本，不写任何 HTML 或 Markdown）：**
 
-```
-<b>一句话概括要点的标题</b>
+- `title`：标题，一句话概括要点。
+- `paragraphs`：正文 1–2 段，每段两三句，只陈述原文事实，不补充原文没有的背景，不加粗。
+- `source_name`：来源媒体名。
+- `source_url`：原文链接（http/https）。
+- 外语原文：标题和正文用简体中文表述，`source_url` 保留原文地址。
+- 可选：`channel_type`（缺省用 `SUBMIT_CHANNEL`）、`image_paths`（本地图片路径，最多 10 张）、`anonymous`（默认 `true`）。
 
-第一段，两三句，只写原文事实。
+**2. 先发预览给用户，等确认。** 用渲染后的样子展示，不要展示 HTML 标签：
 
-第二段（可选）。
+> **标题**
+>
+> 第一段……
+>
+> 第二段……
+>
+> [来源媒体名](原文链接)
 
-<a href="原文链接">媒体名</a>
-```
+并问「确认投稿吗？」。用户要改就改完再预览；用户确认后才调用 `submit_post`。投稿后无法撤回，不得未经确认直接提交。
 
-- 首段：单行 `<b>标题</b>`。
-- 中间 1–2 段：正文，**不加粗**，每段两三句，只陈述原文事实，不补充原文没有的背景。
-- 末段：单行来源链接，**不加「来源：」前缀**。
-- 禁止 Markdown（`**`、`__`、反引号、`[名](链接)`）。
-- 普通文本里的 `<` `>` `&` 须转义为 `&lt;` `&gt;` `&amp;`。
-- 只允许标签：`b i u s a code pre blockquote tg-spoiler`。
-- 不要自己加频道页脚，服务端会追加。
-- 外语原文：正文用简体中文表述，来源链接保留原文地址。
-- 参数：`text` 必填；`channel_type` 缺省用 `SUBMIT_CHANNEL`；`image_paths` 本地图片路径，最多 10 张；`anonymous` 默认 `true`。
+**3. 调用 `submit_post`**，传入上面的字段。工具会自动生成 HTML 并转义特殊字符。
 
 ## 第 6 步：处理结果
 
 | 返回 | 你该怎么做 |
 | --- | --- |
 | 成功（`status=success`） | 告诉用户已送审及 `post_id`。**不要重复投稿。** |
-| `422` | 格式不合格，不保存、不扣次数。按返回的问题列表修改后重投 |
+| `422` | 格式不合格，不保存、不扣次数。按返回的问题修改字段后重新预览、确认、再投 |
 | `401` / `403` / `404` | 密钥、频道 key 有问题。告诉用户检查对应项，不要反复重试 |
 | `429` | 超额（每人每天 20 篇）或过频（每密钥每分钟 6 次）。按 `Retry-After` 等待，不要立即重试 |
 | 超时/断线 | 稿件可能已保存。先请用户联系管理员核对，不要自动补投 |
