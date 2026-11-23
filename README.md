@@ -1,83 +1,230 @@
-# Hermes 接入投稿服务指南
+# 给 AI 的指令：安装投稿 MCP 并学会投稿
 
-本文给 Hermes（或任何 AI 智能体）接入在花投稿服务。投稿只送审，**不会直接发布**。
+> **用法**：把本文整篇发给你的 AI（Hermes 等），再补一句「按这个做，需要的信息我稍后给你」。AI 会自己安装、配置、验证。
+> 你只需要向管理员领取 4 项信息，并在 AI 问你时提供。
 
-## 1. 接入前需要的 4 项信息（向管理员领取）
+---
 
-| 项目 | 说明 |
+以下内容是写给 AI 的。
+
+## 你的任务
+
+为用户安装一个「投稿」MCP 工具 `submit_post`，并在今后用户说「投稿」时用它向频道投稿。投稿只送审，不会直接发布。
+
+## 第 1 步：向用户索要 4 项信息（缺哪项问哪项）
+
+| 变量 | 含义 |
 | --- | --- |
-| `SUBMIT_BASE_URL` | 投稿服务的 HTTPS 地址，例如 `https://example.com`，不带路径 |
-| `SUBMIT_KEY` | 个人投稿密钥，只显示一次，不要写进代码、日志或提示词 |
+| `SUBMIT_BASE_URL` | 投稿服务 HTTPS 地址，不带路径 |
+| `SUBMIT_KEY` | 个人投稿密钥（保密） |
 | `SUBMIT_USER_ID` | 密钥绑定的 Telegram 数字 ID |
-| 频道 key | 被授权的频道配置 key（即 `channel_type`）。不是 `@频道名`、chat ID，也不是查询接口的 `channel_id` |
+| `SUBMIT_CHANNEL` | 频道配置 key（不是 `@频道名`，也不是 chat ID） |
 
-## 2. 方式 A：MCP（推荐）
+密钥只能写进 MCP 配置的 `env`：不要回显、不要写进日志、提示词、笔记或任何仓库。
 
-仓库内 `tools/mcp_submit/server.py`，stdio 协议，仅用 Python 标准库，无需安装依赖。把该文件复制到 Hermes 所在机器，在 MCP 配置里注册：
+## 第 2 步：保存脚本
+
+确认机器上有 `python3`（仅用标准库，无需安装依赖）。把下面整段代码原样保存为一个固定位置的文件（如 `~/mcp/zaihua-submit/server.py`），记下绝对路径：
+
+````python
+#!/usr/bin/env python3
+"""zaihuabot 个人投稿 MCP 服务（stdio，仅标准库）。
+
+环境变量：
+  SUBMIT_BASE_URL  投稿服务 HTTPS 地址（必填）
+  SUBMIT_KEY       个人投稿密钥（必填，不会出现在工具参数或日志中）
+  SUBMIT_USER_ID   密钥绑定的 Telegram 数字 ID（必填）
+  SUBMIT_USER_NAME 显示名（可选，服务端以白名单为准）
+  SUBMIT_CHANNEL   默认频道 key（可选）
+"""
+from __future__ import annotations
+
+import base64
+import json
+import mimetypes
+import os
+import sys
+import urllib.error
+import urllib.request
+
+PROTOCOL = "2024-11-05"
+
+TOOLS = [
+    {
+        "name": "submit_post",
+        "description": (
+            "向频道投稿（只送审，不会直接发布）。text 必须严格符合格式，否则 422 退回（不扣次数）："
+            "首段单行 <b>标题</b>，空一行，1–2 段正文（不加粗，只写原文事实），空一行，"
+            "末段单行来源链接 <a href=\"原文链接\">媒体名</a>（不加“来源：”前缀），共 3–4 段。text 按 Telegram HTML 解析："
+            "可用 <b>、<i>、<a href=\"https://…\">名字</a>；不支持 Markdown，"
+            "** 与 [名](链接) 会原样显示；普通文本里的 < > & 须先转义为 &lt; &gt; &amp;。"
+            "频道页脚由服务端另起一段追加，无需自己加。成功后不要重复投稿。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "正文（Telegram HTML）"},
+                "channel_type": {
+                    "type": "string",
+                    "description": "频道配置 key；缺省用 SUBMIT_CHANNEL",
+                },
+                "image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "本地图片路径，最多 10 张",
+                },
+                "anonymous": {"type": "boolean", "description": "是否匿名，默认 true"},
+            },
+            "required": ["text"],
+        },
+    }
+]
+
+
+def _env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"缺少环境变量 {name}")
+    return value
+
+
+def build_payload(args: dict) -> dict:
+    text = args.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text 不能为空")
+    channel = (args.get("channel_type") or os.environ.get("SUBMIT_CHANNEL", "")).strip()
+    if not channel:
+        raise ValueError("需要 channel_type（或设置 SUBMIT_CHANNEL）")
+    images = args.get("image_paths") or []
+    if len(images) > 10:
+        raise ValueError("单篇最多 10 张图片")
+    items = [{"type": "text", "content": text}]
+    for path in images:
+        mime = mimetypes.guess_type(path)[0] or ""
+        if not mime.startswith("image/"):
+            raise ValueError(f"不是图片文件：{path}")
+        with open(path, "rb") as fh:
+            data = base64.b64encode(fh.read()).decode()
+        items.append({"type": "image", "data": f"data:{mime};base64,{data}"})
+    return {
+        "channel_type": channel,
+        "user_id": int(_env("SUBMIT_USER_ID")),
+        "user_name": os.environ.get("SUBMIT_USER_NAME", "投稿者"),
+        "original_content": json.dumps(items, ensure_ascii=False),
+        "submit_timestamp": 0,
+        "origin_text": "",
+        "is_anonymous": args.get("anonymous", True) is not False,
+    }
+
+
+def submit_post(args: dict) -> str:
+    payload = build_payload(args)
+    base = _env("SUBMIT_BASE_URL").rstrip("/")
+    req = urllib.request.Request(
+        base + "/api/external/v1/submissions",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + _env("SUBMIT_KEY"),
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        retry = exc.headers.get("Retry-After")
+        body = exc.read().decode(errors="replace")
+        extra = f"（Retry-After: {retry}s）" if retry else ""
+        raise RuntimeError(f"HTTP {exc.code}{extra}: {body}") from None
+    except OSError as exc:
+        raise RuntimeError(
+            f"网络错误，稿件可能已保存，请先联系管理员核对再决定是否补投：{exc}"
+        ) from None
+
+
+def handle(msg: dict) -> dict | None:
+    method, mid = msg.get("method"), msg.get("id")
+    if mid is None:  # notification
+        return None
+    if method == "initialize":
+        result = {
+            "protocolVersion": PROTOCOL,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "zaihuabot-submit", "version": "0.1.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        params = msg.get("params") or {}
+        try:
+            if params.get("name") != "submit_post":
+                raise ValueError("未知工具")
+            out, err = submit_post(params.get("arguments") or {}), False
+        except Exception as exc:  # report as tool error, not protocol error
+            out, err = str(exc), True
+        result = {"content": [{"type": "text", "text": out}], "isError": err}
+    elif method == "ping":
+        result = {}
+    else:
+        return {"jsonrpc": "2.0", "id": mid,
+                "error": {"code": -32601, "message": "Method not found"}}
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def main() -> None:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            reply = handle(json.loads(line))
+        except json.JSONDecodeError:
+            reply = {"jsonrpc": "2.0", "id": None,
+                     "error": {"code": -32700, "message": "Parse error"}}
+        if reply is not None:
+            sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
+````
+
+## 第 3 步：注册 MCP
+
+按你自身的 MCP 配置方式，注册一个 stdio 服务，名称 `zaihua-submit`：
 
 ```json
 {
   "mcpServers": {
     "zaihua-submit": {
       "command": "python3",
-      "args": ["/path/to/server.py"],
+      "args": ["<server.py 的绝对路径>"],
       "env": {
-        "SUBMIT_BASE_URL": "https://…",
-        "SUBMIT_KEY": "…",
-        "SUBMIT_USER_ID": "123456789",
-        "SUBMIT_CHANNEL": "频道key"
+        "SUBMIT_BASE_URL": "<第1步>",
+        "SUBMIT_KEY": "<第1步>",
+        "SUBMIT_USER_ID": "<第1步>",
+        "SUBMIT_CHANNEL": "<第1步>"
       }
     }
   }
 }
 ```
 
-可选环境变量：`SUBMIT_USER_NAME`（显示名，服务端以白名单为准）。
+可选 `SUBMIT_USER_NAME`（显示名）。若你的配置格式不同，按你的格式等价写入。然后重载或重启，使配置生效。
 
-工具：`submit_post(text, channel_type?, image_paths?, anonymous?)`
+## 第 4 步：验证（不要用真实稿件试）
 
-- `text`：正文，Telegram HTML，须符合第 4 节格式。示例：
+1. 确认工具列表里出现 `submit_post`。没有 → 检查配置 JSON、脚本路径、`python3`，修好再试。
+2. 直接运行 `python3 <server.py路径>` 并向 stdin 发送 `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` 一行，应返回含 `submit_post` 的结果。
+3. 告诉用户「已装好」。不要为了测试发起真实投稿。
 
-  ```
-  <b>OpenAI 发布新模型</b>\n\nOpenAI 周二发布了新一代模型，称推理能力明显提升。\n\n<a href="https://example.com/news">示例媒体</a>
-  ```
-- `channel_type`：缺省用 `SUBMIT_CHANNEL`。
-- `image_paths`：本地图片路径，最多 10 张。
-- `anonymous`：默认 `true`。
+## 第 5 步：记住投稿规则（长期有效）
 
-## 3. 方式 B：直接调 HTTP
+用户说「投稿」时：把用户回复的那条消息，或用户给出的链接，读懂后整理成稿件，调用 `submit_post`。
 
-```bash
-curl --silent --show-error --fail-with-body \
-  --request POST "${SUBMIT_BASE_URL%/}/api/external/v1/submissions" \
-  --header "Authorization: Bearer ${SUBMIT_KEY}" \
-  --header 'Content-Type: application/json' \
-  --data-binary @- <<'JSON'
-{
-  "channel_type": "频道key",
-  "user_id": 123456789,
-  "user_name": "投稿者",
-  "original_content": "[{\"type\":\"text\",\"content\":\"<b>OpenAI 发布新模型</b>\\n\\nOpenAI 周二发布了新一代模型，称推理能力明显提升。\\n\\n<a href=\\\"https://example.com/news\\\">示例媒体</a>\"}]",
-  "submit_timestamp": 0,
-  "origin_text": "",
-  "is_anonymous": true
-}
-JSON
-```
-
-- `original_content` 是**序列化后的 JSON 字符串**，不能直接传数组；其中 `text` 块的内容必须符合第 4 节格式（上例即合格稿件）。
-- 图片块：`{"type":"image","data":"data:image/jpeg;base64,…"}`。
-- 成功响应含 `status`、`message`、`review_status`、`post_id`。
-
-## 4. 投稿内容格式标准（强制）
-
-适用：`POST /api/external/v1/submissions`（个人投稿密钥，含 MCP）。校验实现见 `app/api/content_format.py`。不适用：视频直传、内部入口 `POST /submit`（AI 整理机器人）。
-
-不符合标准的稿件直接退回：HTTP `422`，**不保存、不占每日次数**，响应 `detail` 列出全部问题和一个正确示例，修正后重投即可。
-
-### 4.1 稿件结构
-
-正文 3–4 段，段间空一行（`\n\n`）：
+稿件必须是 Telegram HTML，3–4 段，段间空一行：
 
 ```
 <b>一句话概括要点的标题</b>
@@ -86,81 +233,27 @@ JSON
 
 第二段（可选）。
 
-<a href="https://example.com/news">媒体名</a>
+<a href="原文链接">媒体名</a>
 ```
 
-| 段落 | 要求 |
+- 首段：单行 `<b>标题</b>`。
+- 中间 1–2 段：正文，**不加粗**，每段两三句，只陈述原文事实，不补充原文没有的背景。
+- 末段：单行来源链接，**不加「来源：」前缀**。
+- 禁止 Markdown（`**`、`__`、反引号、`[名](链接)`）。
+- 普通文本里的 `<` `>` `&` 须转义为 `&lt;` `&gt;` `&amp;`。
+- 只允许标签：`b i u s a code pre blockquote tg-spoiler`。
+- 不要自己加频道页脚，服务端会追加。
+- 外语原文：正文用简体中文表述，来源链接保留原文地址。
+- 参数：`text` 必填；`channel_type` 缺省用 `SUBMIT_CHANNEL`；`image_paths` 本地图片路径，最多 10 张；`anonymous` 默认 `true`。
+
+## 第 6 步：处理结果
+
+| 返回 | 你该怎么做 |
 | --- | --- |
-| 首段 | 单行，整行是 `<b>标题</b>`，加粗内不嵌套其他标签 |
-| 中间 1–2 段 | 正文，不使用 `<b>`；段内可单换行，不可空行；可用 `<i>`、`<a>` 等允许标签 |
-| 末段 | 单行，整行只有一个链接 `<a href="http(s)://…">媒体名</a>`，不加「来源：」前缀，链接属性用双引号 |
+| 成功（`status=success`） | 告诉用户已送审及 `post_id`。**不要重复投稿。** |
+| `422` | 格式不合格，不保存、不扣次数。按返回的问题列表修改后重投 |
+| `401` / `403` / `404` | 密钥、频道 key 有问题。告诉用户检查对应项，不要反复重试 |
+| `429` | 超额（每人每天 20 篇）或过频（每密钥每分钟 6 次）。按 `Retry-After` 等待，不要立即重试 |
+| 超时/断线 | 稿件可能已保存。先请用户联系管理员核对，不要自动补投 |
 
-内容约定（人工审核依据，程序不强制）：只陈述原文事实，不补充原文没有的背景；每段两三句；来源为原文链接。
-
-### 4.1.1 完整示例
-
-合格（标题 + 两段正文 + 来源链接）：
-
-```
-<b>OpenAI 发布新模型，推理能力提升</b>
-
-OpenAI 周二发布新一代模型，称其在数学和编程基准上明显优于上一代。
-
-公司表示模型将先向付费用户开放，API 稍后上线。
-
-<a href="https://example.com/news">示例媒体</a>
-```
-
-常见错误与修正：
-
-| 错误写法 | 问题 | 修正 |
-| --- | --- | --- |
-| `来源：<a href="https://example.com/news">示例媒体</a>` | 多了「来源：」前缀 | 只保留 `<a …>示例媒体</a>` |
-| `**标题**` | Markdown | `<b>标题</b>` |
-| 标题后紧跟正文、无空行 | 段间没有空行 | 每段之间空一行 |
-| `1 < 2 & 3` | 未转义 | `1 &lt; 2 &amp; 3` |
-| 末段 `示例媒体` | 来源没有链接 | `<a href="https://…">示例媒体</a>` |
-
-### 4.2 请求要求
-
-- 必须且只能有 **1 个** `text` 块；可再附图片块（合计最多 10 个媒体）。只有图片没有文字会被退回。
-- 不要自己加频道页脚，服务端会另起一段追加。
-
-### 4.3 文本编码
-
-- 全文是 **Telegram HTML**，不支持 Markdown。`**`、`__`、反引号、`](` 会被退回。
-- 允许标签：`b i u s a code pre blockquote tg-spoiler`，必须成对闭合、正确嵌套；其他标签（`h1`、`br`、`strong`、`em`、`p` 等）一律退回。
-- 普通文本中的 `<` `>` `&` 须转义为 `&lt;` `&gt;` `&amp;`。允许的实体：`&amp; &lt; &gt; &quot; &#数字; &#x十六进制;`。
-
-### 4.4 退回原因对照
-
-| 提示 | 原因与修正 |
-| --- | --- |
-| 必须且只能有 1 个 text 内容块 | 合并为一个文本块 |
-| 结构应为：标题 + 1–2 段正文 + 来源链接行 | 段落数不是 3–4，或段间没有空行 |
-| 首段必须是单行加粗标题 | 标题改为 `<b>…</b>` 且独占一段 |
-| 末段必须是单独一行来源链接 | 末段改为 `<a href="https://…">媒体名</a>`，去掉「来源：」前缀 |
-| 正文不要加粗，仅标题加粗 | 去掉正文中的 `<b>` |
-| 不支持的标签 / 未正确配对 / 未闭合 | 只用允许标签并闭合 |
-| 存在未转义的 `<` `>` / `&` | 转义 |
-| 检测到 Markdown 符号 | 改用 HTML 标签 |
-
-### 4.5 给智能体的提示词（可直接引用）
-
-> 投稿正文必须是 Telegram HTML：首段单行 `<b>标题</b>`，随后 1–2 段正文（不加粗，只写原文事实，每段两三句），末段单行来源链接 `<a href="原文链接">媒体名</a>`（不加「来源：」前缀），段落间空一行。禁止 Markdown；`<`、`>`、`&` 须转义；不要加页脚；只允许 b i u s a code pre blockquote tg-spoiler 标签。被退回时按响应列出的问题修改后重投，成功后不要重复投稿。
-
-### 4.6 变更规则
-
-修改格式规则须同时更新：`app/api/content_format.py`、`tests/test_content_format.py`、本节、`tools/mcp_submit/server.py` 的工具描述。新规则只影响新投稿，不回填已发布稿件。
-
-## 5. 限制与错误处理
-
-- 每人每天最多 **20 篇**（0 点 UTC+8 重置），每个 Key 每分钟最多 6 次尝试。
-- 单篇最多 10 个媒体。
-- `401` 缺少或格式错误的密钥；`403` 密钥无效、停用或频道越权；`404` 频道不存在；`422` 内容校验失败；`429` 额度或限频，按 `Retry-After` 等待，不要立即重试。
-- **成功（含 `review_status` 为 `pending` 或 `blocked`）后不要重复提交**。超时或断线时，稿件可能已保存，先联系管理员核对再补投。
-- 命中屏蔽词的稿件会返回成功并进入人工复核。
-
-## 6. 暂不支持
-
-视频上传（MCP 暂无，HTTP 见 `personal-submission.md`）、查询审核结果（需要另一把查询密钥）、列出可用频道。
+视频投稿暂不支持。
