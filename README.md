@@ -1,6 +1,6 @@
 # 给 AI 的指令：安装投稿 MCP 并学会投稿
 
-> **用法**：把本文整篇发给你的 AI（Hermes 等），再补一句「按这个做，需要的信息我稍后给你」。AI 会自己安装、配置、验证。
+> **用法**：把本文整篇发给你的 AI（任何支持 MCP 的 AI 智能体），再补一句「按这个做，需要的信息我稍后给你」。AI 会自己安装、配置、验证。
 > 你只需要向管理员领取 4 项信息，并在 AI 问你时提供。
 
 ---
@@ -44,34 +44,52 @@ import html
 import json
 import mimetypes
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 
 PROTOCOL = "2024-11-05"
 
+FIELDS = {
+    "title": {"type": "string", "description": "标题，一句话概括要点（纯文本，单行）"},
+    "paragraphs": {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 2,
+        "description": "正文 1–2 段（纯文本，不加粗，段内不要空行）",
+    },
+    "source_name": {"type": "string", "description": "来源媒体名（纯文本）"},
+    "source_url": {"type": "string", "description": "原文链接，http(s)://"},
+}
+REQUIRED = ["title", "paragraphs", "source_name", "source_url"]
+
 TOOLS = [
+    {
+        "name": "preview_post",
+        "description": (
+            "生成投稿预览，不会提交、不联网。只需给出纯文本字段：标题、1–2 段正文、来源名称和链接；"
+            "HTML 由工具生成并转义。返回渲染后的预览，请原样展示给用户并询问是否确认投稿。"
+            "字段不合规会直接报错并说明原因。"
+        ),
+        "inputSchema": {"type": "object", "properties": FIELDS, "required": REQUIRED},
+    },
     {
         "name": "submit_post",
         "description": (
-            "向频道投稿（只送审，不会直接发布）。只需给出纯文本字段：标题、1–2 段正文、"
-            "来源名称和来源链接；HTML 由工具自动生成并转义，不要自己写标签或 Markdown。"
-            "正文只写原文事实，每段两三句。调用前必须先把预览展示给用户并获得确认；"
-            "频道页脚由服务端追加。成功后不要重复投稿。"
+            "向频道投稿（只送审，不会直接发布，投稿后无法撤回）。字段同 preview_post。"
+            "必须先用 preview_post 向用户展示预览并得到明确确认，再带 confirmed=true 调用。"
+            "正文只写原文事实，每段两三句。成功后不要重复投稿。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "标题，一句话概括要点（纯文本）"},
-                "paragraphs": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 1,
-                    "maxItems": 2,
-                    "description": "正文 1–2 段（纯文本，不加粗）",
+                **FIELDS,
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "用户已看过预览并明确确认投稿时才填 true",
                 },
-                "source_name": {"type": "string", "description": "来源媒体名（纯文本）"},
-                "source_url": {"type": "string", "description": "原文链接，http(s)://"},
                 "channel_type": {
                     "type": "string",
                     "description": "频道配置 key；缺省用 SUBMIT_CHANNEL",
@@ -83,9 +101,9 @@ TOOLS = [
                 },
                 "anonymous": {"type": "boolean", "description": "是否匿名，默认 true"},
             },
-            "required": ["title", "paragraphs", "source_name", "source_url"],
+            "required": REQUIRED + ["confirmed"],
         },
-    }
+    },
 ]
 
 
@@ -96,24 +114,53 @@ def _env(name: str) -> str:
     return value
 
 
-def compose_text(args: dict) -> str:
+_MD_MARKS = ("**", "__", "`", "](")
+
+
+def _fields(args: dict) -> tuple[str, list[str], str, str]:
     def clean(name: str) -> str:
         v = args.get(name)
         if not isinstance(v, str) or not v.strip():
             raise ValueError(f"{name} 不能为空")
-        return v.strip()
+        v = v.strip()
+        if "\n" in v or "\r" in v:
+            raise ValueError(f"{name} 必须是单行")
+        return v
 
     title, name, url = clean("title"), clean("source_name"), clean("source_url")
     paras = args.get("paragraphs")
     if (not isinstance(paras, list) or not 1 <= len(paras) <= 2
             or not all(isinstance(x, str) and x.strip() for x in paras)):
         raise ValueError("paragraphs 须为 1–2 段非空文本")
-    if not url.startswith(("http://", "https://")):
-        raise ValueError("source_url 必须以 http:// 或 https:// 开头")
+    paras = [x.strip() for x in paras]
+    if any("\n\n" in x.replace("\r", "") or re.search(r"\n\s*\n", x) for x in paras):
+        raise ValueError("每段内不能有空行，请拆成 paragraphs 的不同元素（最多 2 段）")
+    if not re.match(r"https?://[^\s\"<>]+$", url):
+        raise ValueError("source_url 必须是 http(s):// 开头且不含空格的链接")
+    for label, text in [("title", title), ("source_name", name), *[("paragraphs", x) for x in paras]]:
+        for mark in _MD_MARKS:
+            if mark in text:
+                raise ValueError(f"{label} 含 Markdown 符号 {mark!r}，请只写纯文本")
+    return title, paras, name, url
+
+
+def compose_text(args: dict) -> str:
+    title, paras, name, url = _fields(args)
     esc = lambda t: html.escape(t, quote=False)  # noqa: E731
-    parts = [f"<b>{esc(title)}</b>"] + [esc(x.strip()) for x in paras]
+    parts = [f"<b>{esc(title)}</b>"] + [esc(x) for x in paras]
     parts.append(f'<a href="{html.escape(url, quote=True)}">{esc(name)}</a>')
     return "\n\n".join(parts)
+
+
+def preview_post(args: dict) -> str:
+    title, paras, name, url = _fields(args)
+    compose_text(args)
+    body = "\n\n".join([f"**{title}**", *paras, f"[{name}]({url})"])
+    return (
+        "字段检查通过。以下是预览（原样展示给用户，不要改写），"
+        "请询问「确认投稿吗？」，用户明确确认后再调用 submit_post（confirmed=true）：\n\n"
+        "-----\n" + body + "\n-----"
+    )
 
 
 def build_payload(args: dict) -> dict:
@@ -122,10 +169,14 @@ def build_payload(args: dict) -> dict:
     if not channel:
         raise ValueError("需要 channel_type（或设置 SUBMIT_CHANNEL）")
     images = args.get("image_paths") or []
+    if not isinstance(images, list):
+        raise ValueError("image_paths 须为路径数组")
     if len(images) > 10:
         raise ValueError("单篇最多 10 张图片")
     items = [{"type": "text", "content": text}]
     for path in images:
+        if not os.path.isfile(path):
+            raise ValueError(f"图片文件不存在：{path}")
         mime = mimetypes.guess_type(path)[0] or ""
         if not mime.startswith("image/"):
             raise ValueError(f"不是图片文件：{path}")
@@ -143,7 +194,22 @@ def build_payload(args: dict) -> dict:
     }
 
 
+def _summarize(raw: str) -> str:
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return raw
+    if not isinstance(d, dict):
+        return raw
+    review = {"pending": "待人工审核", "blocked": "命中屏蔽词，进入人工复核"}.get(
+        d.get("review_status"), d.get("review_status"))
+    return (f"投稿成功（{d.get('status')}）：已送审，不要重复投稿。"
+            f"\npost_id: {d.get('post_id')}\n审核状态: {review}\n{d.get('message') or ''}").strip()
+
+
 def submit_post(args: dict) -> str:
+    if args.get("confirmed") is not True:
+        raise ValueError("未确认：请先用 preview_post 向用户展示预览，用户明确确认后再带 confirmed=true 调用")
     payload = build_payload(args)
     base = _env("SUBMIT_BASE_URL").rstrip("/")
     req = urllib.request.Request(
@@ -157,7 +223,7 @@ def submit_post(args: dict) -> str:
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode()
+            return _summarize(resp.read().decode())
     except urllib.error.HTTPError as exc:
         retry = exc.headers.get("Retry-After")
         body = exc.read().decode(errors="replace")
@@ -170,23 +236,27 @@ def submit_post(args: dict) -> str:
 
 
 def handle(msg: dict) -> dict | None:
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"}}
     method, mid = msg.get("method"), msg.get("id")
     if mid is None:  # notification
         return None
     if method == "initialize":
         result = {
-            "protocolVersion": PROTOCOL,
+            "protocolVersion": (msg.get("params") or {}).get("protocolVersion") or PROTOCOL,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "zaihuabot-submit", "version": "0.1.0"},
+            "serverInfo": {"name": "zaihuabot-submit", "version": "0.2.0"},
         }
     elif method == "tools/list":
         result = {"tools": TOOLS}
     elif method == "tools/call":
         params = msg.get("params") or {}
         try:
-            if params.get("name") != "submit_post":
+            fn = {"preview_post": preview_post, "submit_post": submit_post}.get(params.get("name"))
+            if fn is None:
                 raise ValueError("未知工具")
-            out, err = submit_post(params.get("arguments") or {}), False
+            out, err = fn(params.get("arguments") or {}), False
         except Exception as exc:  # report as tool error, not protocol error
             out, err = str(exc), True
         result = {"content": [{"type": "text", "text": out}], "isError": err}
@@ -242,7 +312,7 @@ if __name__ == "__main__":
 
 ## 第 4 步：验证（不要用真实稿件试）
 
-1. 确认工具列表里出现 `submit_post`。没有 → 检查配置 JSON、脚本路径、`python3`，修好再试。
+1. 确认工具列表里出现 `preview_post` 和 `submit_post`。没有 → 检查配置 JSON、脚本路径、`python3`，修好再试。
 2. 告诉用户「已装好」。不要为了测试发起真实投稿。
 
 ## 第 5 步：投稿流程（长期有效）
@@ -258,7 +328,7 @@ if __name__ == "__main__":
 - 外语原文：标题和正文用简体中文表述，`source_url` 保留原文地址。
 - 可选：`channel_type`（缺省用 `SUBMIT_CHANNEL`）、`image_paths`（本地图片路径，最多 10 张）、`anonymous`（默认 `true`）。
 
-**2. 先发预览给用户，等确认。** 用渲染后的样子展示，不要展示 HTML 标签：
+**2. 预览与确认。** 用渲染后的样子展示，不要展示 HTML 标签：
 
 > **标题**
 >
@@ -270,7 +340,9 @@ if __name__ == "__main__":
 
 并问「确认投稿吗？」。用户要改就改完再预览；用户确认后才调用 `submit_post`。投稿后无法撤回，不得未经确认直接提交。
 
-**3. 调用 `submit_post`**，传入上面的字段。工具会自动生成 HTML 并转义特殊字符。
+**3. 先调用 `preview_post`**（不联网、不提交），传入上面的字段。它会检查字段并返回预览，把预览原样展示给用户并问「确认投稿吗？」。字段不合规会报错，按原因改完再试。
+
+**4. 用户明确确认后，调用 `submit_post`**，传入同样的字段并带 `confirmed=true`。未确认时工具会拒绝提交。工具会自动生成 HTML 并转义特殊字符。
 
 ## 第 6 步：处理结果
 
